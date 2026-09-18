@@ -1,0 +1,11 @@
+# Keep live deployment settings and credentials outside the repository.
+config.json
+domains.json
+.env
+.env.*
+*.pem
+*.key
+*.bundle
+private/
+node_modules/
+.DS_Store

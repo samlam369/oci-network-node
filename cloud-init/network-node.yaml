@@ -1,0 +1,321 @@
+#cloud-config
+# ==============================================================================
+# OCI Network Node: Exit Node & SOCKS5 Proxy Configuration
+# ==============================================================================
+# Target OS: Ubuntu 24.04 LTS (Noble) / 26.04 LTS (Resolute)
+# Features:
+#   - Tailscale: Exit Node, Tailscale SSH, Connector & Auto-Update
+#   - Dante SOCKS5: No-password proxy on tailscale0:1080; restrict Tailnet access
+#   - Telegram: One-time ready notification via OCI Vault credentials
+#   - Network Tuning: TCP BBR congestion control & GRO forwarding optimizations
+# ==============================================================================
+
+# Disable only cloud-init's built-in index update: oci-apt-install refreshes
+# indexes in runcmd with bounded retries, so recovered failures do not leave
+# cloud-init in a degraded state. Package indexes are still updated at boot.
+package_update: false
+# Skip full-system/kernel upgrades to keep disposable proxy nodes quick to boot.
+# Required package installs may still upgrade their dependencies; refresh the
+# base image periodically for security fixes instead of upgrading everything here.
+package_upgrade: false
+
+write_files:
+  - path: /etc/apt/apt.conf.d/80-oci-bootstrap-retries
+    permissions: '0644'
+    content: |
+      Acquire::Retries "3";
+      Acquire::http::Timeout "30";
+      Acquire::https::Timeout "30";
+
+  - path: /usr/local/sbin/oci-apt-install
+    permissions: '0755'
+    content: |
+      #!/bin/sh
+      # Retry the complete update/install transaction, not just a failed download.
+      set -u
+      export DEBIAN_FRONTEND=noninteractive
+      attempt=1
+      while [ "$attempt" -le 3 ]; do
+          echo "OCI_APT attempt=$attempt/3 packages=$*"
+          if apt-get -o APT::Update::Error-Mode=any update &&
+             apt-get -o DPkg::Lock::Timeout=60 install -y "$@"; then
+              echo "OCI_APT success attempt=$attempt packages=$*"
+              exit 0
+          fi
+          echo "OCI_APT failed attempt=$attempt packages=$*" >&2
+          if [ "$attempt" -eq 3 ]; then
+              echo "OCI_APT exhausted retries; bootstrap stopped" >&2
+              exit 1
+          fi
+          sleep "$((attempt * 15))"
+          attempt=$((attempt + 1))
+      done
+
+  - path: /etc/oci-telegram-secret-id
+    owner: root:root
+    permissions: '0600'
+    content: |
+      <TELEGRAM_SECRET_OCID>
+
+  - path: /usr/local/sbin/oci-ready-notify
+    owner: root:root
+    permissions: '0700'
+    content: |
+      #!/usr/bin/python3
+      import base64
+      import html
+      import ipaddress
+      import json
+      from pathlib import Path
+      import socket
+      import subprocess
+      import sys
+      import urllib.request
+
+      def run(*args):
+          return subprocess.run(args, check=True, capture_output=True,
+                                text=True, timeout=90).stdout
+
+      def build_payload(config, address, hostname):
+          payload = {
+              "chat_id": int(config["chatId"]),
+              "parse_mode": "HTML",
+              "text": (f"\u2705 OCI Node Ready\n"
+                       f"Hostname: <code>{html.escape(hostname)}</code>\n"
+                       f"Tailscale IP: <code>{html.escape(address)}</code>"),
+          }
+          if "messageThreadId" in config:
+              value = config["messageThreadId"]
+              if isinstance(value, bool) or not isinstance(value, (int, str)):
+                  raise ValueError("messageThreadId must be a positive integer")
+              thread_id = int(value)
+              if thread_id <= 0:
+                  raise ValueError("messageThreadId must be a positive integer")
+              payload["message_thread_id"] = thread_id
+          return payload
+
+      def check_cloud_init():
+          result = subprocess.run(
+              ["cloud-init", "status", "--format", "json"],
+              capture_output=True, text=True, timeout=90)
+          if result.returncode not in (0, 2):
+              raise RuntimeError()
+          status = json.loads(result.stdout)
+          if status.get("status") != "done" or status.get("errors"):
+              raise RuntimeError()
+          # OCI images warn when opc redirect has no metadata SSH keys.
+          # This does not prevent Ubuntu/Tailscale services from starting.
+          allowed_warning = (
+              "Unable to disable SSH logins for opc given ssh_redirect_user: "
+              "ubuntu. No cloud public-keys present.")
+          for level, messages in status.get("recoverable_errors", {}).items():
+              for message in messages:
+                  if level != "WARNING" or message != allowed_warning:
+                      raise RuntimeError()
+
+      def main():
+          # cloud-init's instance directory changes for each new instance.
+          marker = Path("/var/lib/cloud/instance/telegram-ready.sent")
+          if marker.exists():
+              return
+          stage = "cloud-init readiness"
+          try:
+              check_cloud_init()
+              stage = "Tailscale readiness"
+              status = json.loads(run("tailscale", "status", "--json"))
+              if status.get("BackendState") != "Running" or not status.get("Self", {}).get("Online"):
+                  raise RuntimeError()
+              address = next(ip for ip in status["Self"]["TailscaleIPs"]
+                             if ipaddress.ip_address(ip) in ipaddress.ip_network("100.64.0.0/10"))
+              stage = "SOCKS5 readiness"
+              run("systemctl", "is-active", "--quiet", "danted")
+              with socket.create_connection((address, 1080), timeout=10) as proxy:
+                  proxy.sendall(b"\x05\x01\x00")
+                  reply = b""
+                  while len(reply) < 2:
+                      chunk = proxy.recv(2 - len(reply))
+                      if not chunk:
+                          break
+                      reply += chunk
+                  if reply != b"\x05\x00":
+                      raise RuntimeError()
+              stage = "OCI Vault credentials"
+              secret_id = Path("/etc/oci-telegram-secret-id").read_text().strip()
+              if not secret_id.startswith("ocid1.vaultsecret."):
+                  raise ValueError()
+              encoded = run("/opt/oci-cli/bin/oci", "secrets", "secret-bundle", "get",
+                            "--auth", "instance_principal", "--region", secret_id.split(".")[3],
+                            "--secret-id", secret_id, "--stage", "CURRENT",
+                            "--query", 'data."secret-bundle-content".content', "--raw-output")
+              config = json.loads(base64.b64decode(encoded, validate=False))
+              payload = build_payload(config, address, socket.gethostname())
+              token = config["botToken"].strip()
+              if not token:
+                  raise ValueError()
+              stage = "Telegram sendMessage"
+              request = urllib.request.Request(
+                  f"https://api.telegram.org/bot{token}/sendMessage",
+                  data=json.dumps(payload).encode(),
+                  headers={"Content-Type": "application/json"}, method="POST")
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  if json.load(response).get("ok") is not True:
+                      raise RuntimeError()
+              stage = "notification marker"
+              marker.touch(mode=0o600)
+              print("Telegram ready notification sent.")
+          except Exception:
+              # Exceptions/HTTP URLs and CLI output can contain credentials.
+              print(f"Ready notification failed at: {stage}; retry in 60s.", file=sys.stderr)
+              sys.exit(1)
+
+      if __name__ == "__main__":
+          main()
+
+  - path: /etc/systemd/system/oci-ready-notify.service
+    owner: root:root
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Send OCI node readiness to Telegram
+      After=cloud-final.service network-online.target tailscaled.service danted.service
+      Wants=network-online.target
+      StartLimitIntervalSec=0
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/oci-ready-notify
+      Restart=on-failure
+      RestartSec=60
+      TimeoutStartSec=5min
+      UMask=0077
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  # Stop on setup errors so later success cannot hide a failed command.
+  - set -e
+  # ==========================================
+  # Tailscale Installation
+  # ==========================================
+  - |
+    . /etc/os-release
+    case "$ID:$VERSION_CODENAME" in
+      ubuntu:noble|ubuntu:resolute) ;;
+      *) echo "Unsupported OS: $ID $VERSION_CODENAME" >&2; exit 1 ;;
+    esac
+  - /usr/local/sbin/oci-apt-install ca-certificates curl dante-server ethtool networkd-dispatcher python3-venv
+  - curl -fsSL --retry 3 https://pkgs.tailscale.com/stable/ubuntu/${VERSION_CODENAME}.noarmor.gpg -o /usr/share/keyrings/tailscale-archive-keyring.gpg
+  - curl -fsSL --retry 3 https://pkgs.tailscale.com/stable/ubuntu/${VERSION_CODENAME}.tailscale-keyring.list -o /etc/apt/sources.list.d/tailscale.list
+  - /usr/local/sbin/oci-apt-install tailscale
+
+  # ==========================================
+  # IP Forwarding (required for exit node)
+  # ==========================================
+  - echo 'net.ipv4.ip_forward = 1' | tee -a /etc/sysctl.d/99-tailscale.conf
+  - echo 'net.ipv6.conf.all.forwarding = 1' | tee -a /etc/sysctl.d/99-tailscale.conf
+  - sysctl -p /etc/sysctl.d/99-tailscale.conf
+
+  # ==========================================
+  # TCP BBR Congestion Control
+  # ==========================================
+  - echo "tcp_bbr" | tee -a /etc/modules-load.d/modules.conf
+  - modprobe tcp_bbr
+  - sysctl -w net.core.default_qdisc=fq
+  - sysctl -w net.ipv4.tcp_congestion_control=bbr
+  - echo 'net.core.default_qdisc = fq' | tee -a /etc/sysctl.conf
+  - echo 'net.ipv4.tcp_congestion_control = bbr' | tee -a /etc/sysctl.conf
+
+  # ==========================================
+  # GRO Optimization
+  # ==========================================
+  - systemctl enable networkd-dispatcher
+  - systemctl start networkd-dispatcher
+  - mkdir -p /etc/networkd-dispatcher/routable.d
+  - |
+    cat <<'GROEOF' > /etc/networkd-dispatcher/routable.d/50-tailscale
+    #!/bin/sh
+    NETDEV=$(ip -o route get 8.8.8.8 | cut -f 5 -d " ")
+    ethtool -K $NETDEV rx-udp-gro-forwarding on rx-gro-list off
+    GROEOF
+  - chmod 755 /etc/networkd-dispatcher/routable.d/50-tailscale
+  - /etc/networkd-dispatcher/routable.d/50-tailscale
+
+  # ==========================================
+  # OCI CLI (isolated venv - avoids system Python package conflicts)
+  # ==========================================
+  # PyYAML can build its Python implementation without a compiler toolchain.
+  - python3 -m venv /opt/oci-cli
+  - /opt/oci-cli/bin/pip install --upgrade pip oci-cli
+
+  # ==========================================
+  # Tailscale: fetch auth key from OCI Vault, then connect
+  # ==========================================
+  # Secret stored in OCI Vault; retrieved at boot via instance principal (no plaintext key here).
+  - |
+    TS_KEY_B64=$(/opt/oci-cli/bin/oci secrets secret-bundle get \
+      --auth instance_principal \
+      --region "<TAILSCALE_SECRET_REGION>" \
+      --secret-id "<TAILSCALE_SECRET_OCID>" \
+      --query 'data."secret-bundle-content".content' --raw-output)
+    TS_KEY=$(printf '%s' "$TS_KEY_B64" | base64 -d)
+    test -n "$TS_KEY"
+    tailscale up --authkey="$TS_KEY" --advertise-exit-node --advertise-tags="<TAILSCALE_NODE_TAG>" --accept-routes --ssh || { echo "TAILSCALE UP FAILED" >&2; exit 1; }
+  - unset TS_KEY TS_KEY_B64
+  - tailscale set --advertise-connector
+  - tailscale set --auto-update
+
+  # ==========================================
+  # SOCKS5 Proxy (Dante) Configuration
+  # ==========================================
+  - mv /etc/danted.conf /etc/danted.conf.bak || true
+  - |
+    NETDEV=$(ip -o route get 8.8.8.8 | cut -f 5 -d " ")
+    cat <<DANTEEOF > /etc/danted.conf
+    logoutput: syslog
+    user.privileged: root
+    user.notprivileged: nobody
+
+    # Internal: Listen only on Tailscale interface
+    internal: tailscale0 port = 1080
+
+    # External: Outbound interface
+    external: $NETDEV
+
+    # Authentication: None (Relies on Tailscale wireguard security)
+    clientmethod: none
+    socksmethod: none
+
+    # Client rules: Allow connection from Tailscale subnet (100.64.0.0/10)
+    client pass {
+        from: 100.64.0.0/10 to: 0.0.0.0/0
+        log: error
+    }
+
+    # Routing rules: Allow TCP/UDP traffic to any destination
+    socks pass {
+        from: 100.64.0.0/10 to: 0.0.0.0/0
+        protocol: tcp udp
+        log: error
+    }
+    DANTEEOF
+
+  # ==========================================
+  # Dante: Ensure starts after Tailscale
+  # ==========================================
+  - mkdir -p /etc/systemd/system/danted.service.d
+  - |
+    cat <<'OVERRIDEEOF' > /etc/systemd/system/danted.service.d/override.conf
+    [Unit]
+    After=tailscaled.service
+    Wants=tailscaled.service
+    OVERRIDEEOF
+  - systemctl daemon-reload
+  - systemctl enable danted
+  - systemctl restart danted
+
+  # Queue without blocking: notifier must wait until cloud-final exits.
+  - systemctl enable oci-ready-notify.service
+  - systemctl start --no-block oci-ready-notify.service
+
+final_message: "Cloud-init finished. Check cloud-init status and Telegram for node readiness."

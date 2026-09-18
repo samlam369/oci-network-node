@@ -1,0 +1,6 @@
+{
+  "region": "ap-hyderabad-1",
+  "compartmentOcid": "ocid1.compartment.oc1..xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "instanceConfigOcid": "ocid1.instanceconfiguration.oc1.ap-hyderabad-1.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "namePrefix": "OCI-NETWORK-NODE"
+}
