@@ -9,6 +9,32 @@ The CLI launches an existing **OCI Instance Configuration**. That saved template
 owns cloud-init, image, shape, subnet and instance-principal setup. Editing the
 repository's cloud-init does **not** update saved templates or running nodes.
 
+## What a launch looks like
+
+The following output is illustrative; instance names, OCIDs, wait time and IP
+addresses vary by deployment.
+
+```console
+$ ssh user@control-host "node ~/repos/oci-network-node/scripts/launch.mjs --wait"
+Launching instance "OCI-NETWORK-NODE-0918-2225" from Instance Configuration ...
+
+✔ Launched
+  name:  OCI-NETWORK-NODE-0918-2225
+  ocid:  ocid1.instance.oc1.example
+  state: PROVISIONING
+
+Waiting for RUNNING..... RUNNING
+
+✔ Instance RUNNING
+  public IP: 203.0.113.42
+
+Cloud-init may still be running. Wait for the Telegram ready notification before using the node.
+```
+
+`--wait` returning means OCI has reached **RUNNING**, not that cloud-init or the
+network services are ready. The later Telegram notification reports the node's
+local readiness checks.
+
 ## Prerequisites and configuration
 
 The control host needs Node.js 22+, the official OCI CLI, and OCI credentials
